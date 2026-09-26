@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 @pytest.fixture()
 def client(tmp_path: Path):
     os.environ["TOWNSHIP_DATABASE_PATH"] = str(tmp_path / "test.db")
+    os.environ["TOWNSHIP_ARTIFACT_ROOT"] = str(tmp_path / "artifacts")
+    os.environ["TOWNSHIP_ARTIFACT_DOWNLOAD_SECRET"] = "test-download-secret"
     from app.database import close_connection
     close_connection()
     from app.main import app

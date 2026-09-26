@@ -74,6 +74,154 @@ class ComputeRepository:
     def result_versions(self, task_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM compute_results WHERE task_id=? ORDER BY version", (task_id,)).fetchall()]
 
+    def result_version(self, task_id: int, version: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_results WHERE task_id=? AND version=?", (task_id, version)).fetchone()
+
+    def result_by_receipt(self, task_id: int, receipt: str) -> sqlite3.Row | None:
+        if not receipt:
+            return None
+        return self.connection.execute("SELECT * FROM compute_results WHERE task_id=? AND completion_receipt=?", (task_id, receipt)).fetchone()
+
+    def create_result(
+        self,
+        *,
+        task_id: int,
+        version: int,
+        result: dict[str, Any],
+        metrics: dict[str, Any],
+        result_digest: str,
+        completion_receipt: str,
+        created_by: str,
+        now: str,
+    ) -> int:
+        cursor = self.connection.execute(
+            "INSERT INTO compute_results(task_id,version,result_json,metrics_json,result_digest,completion_receipt,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                task_id,
+                version,
+                json.dumps(result, ensure_ascii=False, sort_keys=True),
+                json.dumps(metrics, ensure_ascii=False, sort_keys=True),
+                result_digest,
+                completion_receipt,
+                created_by,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def add_artifact(
+        self,
+        *,
+        task_id: int,
+        result_version: int,
+        relative_path: str,
+        size_bytes: int,
+        sha256: str,
+        summary: str,
+        purpose: str,
+        role: str,
+        retain_until: str,
+        created_by: str,
+        now: str,
+    ) -> int:
+        cursor = self.connection.execute(
+            "INSERT INTO compute_result_artifacts(task_id,result_version,relative_path,size_bytes,sha256,summary,purpose,role,status,retain_until,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,'candidate',?,?,?)",
+            (task_id, result_version, relative_path, size_bytes, sha256, summary, purpose, role, retain_until, created_by, now),
+        )
+        return int(cursor.lastrowid)
+
+    def artifact_by_id(self, artifact_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_result_artifacts WHERE id=?", (artifact_id,)).fetchone()
+
+    def artifacts(self, task_id: int, *, version: int | None = None) -> list[dict[str, Any]]:
+        if version is None:
+            rows = self.connection.execute("SELECT * FROM compute_result_artifacts WHERE task_id=? ORDER BY result_version,id", (task_id,)).fetchall()
+        else:
+            rows = self.connection.execute("SELECT * FROM compute_result_artifacts WHERE task_id=? AND result_version=? ORDER BY id", (task_id, version)).fetchall()
+        return [dict(row) for row in rows]
+
+    def all_artifacts(self, *, statuses: list[str] | None = None) -> list[dict[str, Any]]:
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            rows = self.connection.execute(
+                f"SELECT * FROM compute_result_artifacts WHERE status IN ({placeholders}) ORDER BY id", statuses
+            ).fetchall()
+        else:
+            rows = self.connection.execute("SELECT * FROM compute_result_artifacts ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
+
+    def set_artifact_status(self, artifact_id: int, *, status: str, now: str, revoked_reason: str = "") -> None:
+        if status == "published":
+            self.connection.execute(
+                "UPDATE compute_result_artifacts SET status='published',published_at=COALESCE(published_at,?),revoked_at=NULL,revoked_reason='',deleted_at=NULL WHERE id=?",
+                (now, artifact_id),
+            )
+        elif status == "revoked":
+            self.connection.execute(
+                "UPDATE compute_result_artifacts SET status='revoked',revoked_at=?,revoked_reason=? WHERE id=?",
+                (now, revoked_reason, artifact_id),
+            )
+        elif status == "deleted":
+            self.connection.execute(
+                "UPDATE compute_result_artifacts SET status='deleted',deleted_at=? WHERE id=?",
+                (now, artifact_id),
+            )
+        else:
+            raise ValueError(f"不支持的制品状态：{status}")
+
+    def publish_result(self, task_id: int, version: int, *, actor: str, reason: str, now: str, retain_until: str) -> None:
+        # 首次发布记录发布人/理由；重复发布只延长保留期，保留首次发布信息。
+        self.connection.execute(
+            "UPDATE compute_results SET published_at=COALESCE(published_at,?),published_by=CASE WHEN published_by='' THEN ? ELSE published_by END,publish_reason=CASE WHEN publish_reason='' THEN ? ELSE publish_reason END WHERE task_id=? AND version=?",
+            (now, actor, reason, task_id, version),
+        )
+        self.connection.execute(
+            "UPDATE compute_result_artifacts SET status='published',published_at=COALESCE(published_at,?),retain_until=MAX(retain_until,?),revoked_at=NULL,revoked_reason='',deleted_at=NULL WHERE task_id=? AND result_version=? AND role='permanent' AND status<>'revoked' AND status<>'deleted'",
+            (now, retain_until, task_id, version),
+        )
+
+    def revoke_result(self, task_id: int, version: int, *, actor: str, reason: str, now: str) -> None:
+        self.connection.execute(
+            "UPDATE compute_results SET revoked_at=?,revoked_by=?,revoke_reason=? WHERE task_id=? AND version=?",
+            (now, actor, reason, task_id, version),
+        )
+        self.connection.execute(
+            "UPDATE compute_result_artifacts SET status='revoked',revoked_at=?,revoked_reason=? WHERE task_id=? AND result_version=? AND status='published'",
+            (now, reason, task_id, version),
+        )
+
+    def revoke_artifacts(self, task_id: int, version: int, artifact_ids: list[int], *, reason: str, now: str) -> int:
+        placeholders = ",".join("?" for _ in artifact_ids)
+        cursor = self.connection.execute(
+            f"UPDATE compute_result_artifacts SET status='revoked',revoked_at=?,revoked_reason=? WHERE task_id=? AND result_version=? AND id IN ({placeholders}) AND status IN ('published','candidate')",
+            [now, reason, task_id, version, *artifact_ids],
+        )
+        return int(cursor.rowcount)
+
+    def path_has_live_sibling(self, task_id: int, relative_path: str, *, exclude_artifact_id: int, now: str) -> bool:
+        """同一路径是否还有已发布或仍在保留期内、且未删除的其他记录。"""
+        row = self.connection.execute(
+            "SELECT 1 FROM compute_result_artifacts "
+            "WHERE task_id=? AND relative_path=? AND id<>? AND status<>'deleted' "
+            "AND (status='published' OR (retain_until<>'' AND retain_until>?)) LIMIT 1",
+            (task_id, relative_path, exclude_artifact_id, now),
+        ).fetchone()
+        return row is not None
+
+    def path_referenced_by_published_result(self, task_id: int, relative_path: str, *, exclude_artifact_id: int | None = None) -> bool:
+        sql = (
+            "SELECT 1 FROM compute_result_artifacts a "
+            "JOIN compute_results r ON r.task_id=a.task_id AND r.version=a.result_version "
+            "WHERE a.task_id=? AND a.relative_path=? AND a.status='published' "
+            "AND r.published_at IS NOT NULL AND r.revoked_at IS NULL"
+        )
+        params: list[Any] = [task_id, relative_path]
+        if exclude_artifact_id is not None:
+            sql += " AND a.id<>?"
+            params.append(exclude_artifact_id)
+        sql += " LIMIT 1"
+        return self.connection.execute(sql, params).fetchone() is not None
+
     def interventions(self, task_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM compute_interventions WHERE task_id=? ORDER BY id", (task_id,)).fetchall()]
 

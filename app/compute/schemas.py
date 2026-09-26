@@ -38,10 +38,21 @@ class TaskClaim(BaseModel):
     lease_seconds: int = Field(default=60, ge=5, le=3600)
 
 
+class ArtifactManifest(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=4096)
+    size_bytes: int = Field(ge=0, le=1024 * 1024 * 1024 * 1024)
+    sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-fA-F0-9]{64}$")
+    summary: str = Field(min_length=1, max_length=1000)
+    purpose: Literal["mesh", "log", "checklist", "other"]
+    role: Literal["temporary", "permanent"] = "permanent"
+
+
 class TaskResult(BaseModel):
     worker_id: str = Field(min_length=1, max_length=120)
     result: dict[str, Any]
     metrics: dict[str, Any] = Field(default_factory=dict)
+    completion_receipt: str = Field(default="", max_length=160)
+    artifacts: list[ArtifactManifest] = Field(default_factory=list, max_length=200)
 
 
 class TaskFailure(BaseModel):
@@ -49,6 +60,21 @@ class TaskFailure(BaseModel):
     error_code: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=2000)
     retryable: bool = True
+
+
+class PublishRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
+
+
+class RevokeRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
+    artifact_ids: list[int] | None = Field(default=None, max_length=200)
+
+
+class DownloadAuthorizationRequest(BaseModel):
+    requester: str = Field(min_length=1, max_length=120)
 
 
 class CancelRequest(BaseModel):

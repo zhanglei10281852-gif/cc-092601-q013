@@ -277,6 +277,13 @@ CREATE TABLE IF NOT EXISTS compute_results (
     result_json TEXT NOT NULL,
     metrics_json TEXT NOT NULL DEFAULT '{}',
     result_digest TEXT NOT NULL,
+    completion_receipt TEXT NOT NULL DEFAULT '',
+    published_at TEXT,
+    published_by TEXT NOT NULL DEFAULT '',
+    publish_reason TEXT NOT NULL DEFAULT '',
+    revoked_at TEXT,
+    revoked_by TEXT NOT NULL DEFAULT '',
+    revoke_reason TEXT NOT NULL DEFAULT '',
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(task_id, version)
@@ -293,6 +300,30 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+CREATE TABLE IF NOT EXISTS compute_result_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    result_version INTEGER NOT NULL,
+    relative_path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+    sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+    summary TEXT NOT NULL,
+    purpose TEXT NOT NULL CHECK(purpose IN ('mesh','log','checklist','other')),
+    role TEXT NOT NULL DEFAULT 'permanent' CHECK(role IN ('temporary','permanent')),
+    status TEXT NOT NULL DEFAULT 'candidate' CHECK(status IN ('candidate','published','revoked','deleted')),
+    retain_until TEXT NOT NULL DEFAULT '',
+    published_at TEXT,
+    revoked_at TEXT,
+    revoked_reason TEXT NOT NULL DEFAULT '',
+    deleted_at TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, result_version, relative_path),
+    FOREIGN KEY(task_id, result_version) REFERENCES compute_results(task_id, version) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_compute_artifacts_path ON compute_result_artifacts(task_id,relative_path);
+CREATE INDEX IF NOT EXISTS idx_compute_artifacts_version ON compute_result_artifacts(task_id,result_version);
+CREATE INDEX IF NOT EXISTS idx_compute_artifacts_status ON compute_result_artifacts(status,retain_until);
 '''
 
 PERMISSIONS = [
@@ -359,10 +390,34 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_column(connection: sqlite3.Connection, *, table: str, column: str, definition: str) -> None:
+    columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_column(
+            connection,
+            table="compute_results",
+            column="completion_receipt",
+            definition="TEXT NOT NULL DEFAULT ''",
+        )
+        for column, definition in (
+            ("published_at", "TEXT"),
+            ("published_by", "TEXT NOT NULL DEFAULT ''"),
+            ("publish_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("revoked_at", "TEXT"),
+            ("revoked_by", "TEXT NOT NULL DEFAULT ''"),
+            ("revoke_reason", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            _ensure_column(connection, table="compute_results", column=column, definition=definition)
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_compute_results_receipt ON compute_results(task_id, completion_receipt) WHERE completion_receipt <> ''"
+        )
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
