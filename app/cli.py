@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -51,6 +54,20 @@ def command_compute_demo() -> int:
         "max_runtime_seconds": 60,
         "max_attempts": 3,
     }
+    artifact_root = Path(os.getenv("TOWNSHIP_ARTIFACT_ROOT", str(Path(__file__).resolve().parent.parent / "data" / "artifacts")))
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    artifact_file = artifact_root / "demo" / "estimate.log"
+    artifact_file.parent.mkdir(parents=True, exist_ok=True)
+    artifact_file.write_text("monte-carlo demo finished\n", encoding="utf-8")
+    content = artifact_file.read_bytes()
+    manifest = [
+        {
+            "relative_path": "demo/estimate.log",
+            "size_bytes": len(content),
+            "digest": hashlib.sha256(content).hexdigest(),
+            "purpose": "log",
+        }
+    ]
     with TestClient(app) as client:
         created = client.post("/api/compute/templates?actor=cli-demo", json=template)
         if created.status_code not in {201, 409}:
@@ -71,9 +88,40 @@ def command_compute_demo() -> int:
             "/api/compute/tasks/claim",
             json={"worker_id": "cli-worker", "capabilities": ["monte-carlo"], "lease_seconds": 60},
         )
-    result = {"task": task.status_code, "claimed": claimed.status_code, "task_id": task.json().get("id")}
+        completed = None
+        grant = None
+        if claimed.status_code == 200 and claimed.json().get("task"):
+            task_id = claimed.json()["task"]["id"]
+            completed = client.post(
+                f"/api/compute/tasks/{task_id}/complete",
+                json={
+                    "worker_id": "cli-worker",
+                    "result": {"estimate": 3.1416},
+                    "metrics": {"seconds": 1},
+                    "artifacts": manifest,
+                    "receipt_key": "compute-demo-receipt-000001",
+                },
+            )
+            grant = client.post("/api/compute/downloads/authorize", json={"task_id": task_id, "requester": "cli-user"})
+    result = {
+        "task": task.status_code,
+        "claimed": claimed.status_code,
+        "task_id": task.json().get("id"),
+        "completed": completed.status_code if completed is not None else None,
+        "grant": grant.status_code if grant is not None else None,
+    }
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if task.status_code == 202 and claimed.status_code == 200 and claimed.json().get("task") else 1
+    ok = (
+        task.status_code == 202
+        and claimed.status_code == 200
+        and claimed.json().get("task")
+        and completed is not None
+        and completed.status_code == 200
+        and grant is not None
+        and grant.status_code == 200
+        and len(grant.json().get("artifacts", [])) == 1
+    )
+    return 0 if ok else 1
 
 
 def main() -> int:

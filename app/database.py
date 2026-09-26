@@ -277,10 +277,30 @@ CREATE TABLE IF NOT EXISTS compute_results (
     result_json TEXT NOT NULL,
     metrics_json TEXT NOT NULL DEFAULT '{}',
     result_digest TEXT NOT NULL,
+    receipt_key TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'candidate' CHECK(status IN ('candidate','published','withdrawn')),
+    retention_until TEXT NOT NULL DEFAULT '',
+    published_at TEXT,
+    withdrawn_at TEXT,
+    withdraw_reason TEXT NOT NULL DEFAULT '',
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(task_id, version)
 );
+CREATE TABLE IF NOT EXISTS compute_result_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    result_version INTEGER NOT NULL,
+    receipt_key TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+    digest TEXT NOT NULL,
+    purpose TEXT NOT NULL CHECK(purpose IN ('grid','log','checklist','other')),
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, result_version, relative_path),
+    FOREIGN KEY(task_id, result_version) REFERENCES compute_results(task_id, version) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_compute_artifacts_version ON compute_result_artifacts(task_id, result_version);
 CREATE TABLE IF NOT EXISTS compute_interventions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
@@ -359,10 +379,29 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _migrate_compute_results(connection: sqlite3.Connection) -> None:
+    """为既有数据库补齐结果版本与制品元数据所需的列和索引。"""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(compute_results)")}
+    additions = {
+        "receipt_key": "ALTER TABLE compute_results ADD COLUMN receipt_key TEXT NOT NULL DEFAULT ''",
+        "status": "ALTER TABLE compute_results ADD COLUMN status TEXT NOT NULL DEFAULT 'candidate'",
+        "retention_until": "ALTER TABLE compute_results ADD COLUMN retention_until TEXT NOT NULL DEFAULT ''",
+        "published_at": "ALTER TABLE compute_results ADD COLUMN published_at TEXT",
+        "withdrawn_at": "ALTER TABLE compute_results ADD COLUMN withdrawn_at TEXT",
+        "withdraw_reason": "ALTER TABLE compute_results ADD COLUMN withdraw_reason TEXT NOT NULL DEFAULT ''",
+    }
+    for name, statement in additions.items():
+        if name not in columns:
+            connection.execute(statement)
+    connection.execute("UPDATE compute_results SET receipt_key='legacy-' || id WHERE receipt_key=''")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_compute_results_receipt ON compute_results(task_id, receipt_key)")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_compute_results(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

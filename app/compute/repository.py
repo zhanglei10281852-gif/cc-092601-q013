@@ -74,6 +74,37 @@ class ComputeRepository:
     def result_versions(self, task_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM compute_results WHERE task_id=? ORDER BY version", (task_id,)).fetchall()]
 
+    def result_version(self, task_id: int, version: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_results WHERE task_id=? AND version=?", (task_id, version)).fetchone()
+
+    def result_by_receipt(self, task_id: int, receipt_key: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_results WHERE task_id=? AND receipt_key=?", (task_id, receipt_key)).fetchone()
+
+    def artifacts_for(self, task_id: int, version: int | None = None) -> list[dict[str, Any]]:
+        if version is None:
+            rows = self.connection.execute("SELECT * FROM compute_result_artifacts WHERE task_id=? ORDER BY result_version,relative_path", (task_id,)).fetchall()
+        else:
+            rows = self.connection.execute("SELECT * FROM compute_result_artifacts WHERE task_id=? AND result_version=? ORDER BY relative_path", (task_id, version)).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_artifact(self, *, task_id: int, result_version: int, receipt_key: str, relative_path: str, size_bytes: int, digest: str, purpose: str, now: str) -> None:
+        self.connection.execute(
+            "INSERT INTO compute_result_artifacts(task_id,result_version,receipt_key,relative_path,size_bytes,digest,purpose,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (task_id, result_version, receipt_key, relative_path, size_bytes, digest, purpose, now),
+        )
+
+    def artifact_cleanup_rows(self) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT a.id,a.task_id,a.result_version,a.relative_path,a.size_bytes,a.digest,a.purpose,r.status AS result_status,r.retention_until,t.status AS task_status,t.current_result_version FROM compute_result_artifacts a JOIN compute_results r ON r.task_id=a.task_id AND r.version=a.result_version JOIN compute_tasks t ON t.id=a.task_id ORDER BY a.task_id,a.result_version,a.relative_path"
+        ).fetchall()
+
+    def is_active_admin(self, username: str) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM users u JOIN user_roles ur ON ur.user_id=u.id JOIN roles r ON r.id=ur.role_id WHERE u.username=? AND u.status='active' AND r.code='administrator' LIMIT 1",
+            (username,),
+        ).fetchone()
+        return row is not None
+
     def interventions(self, task_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM compute_interventions WHERE task_id=? ORDER BY id", (task_id,)).fetchall()]
 

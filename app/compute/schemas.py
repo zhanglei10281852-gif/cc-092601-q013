@@ -38,10 +38,31 @@ class TaskClaim(BaseModel):
     lease_seconds: int = Field(default=60, ge=5, le=3600)
 
 
+class ArtifactSpec(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=500)
+    size_bytes: int = Field(ge=0, le=1_000_000_000_000)
+    digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
+    purpose: Literal["grid", "log", "checklist", "other"] = "other"
+
+
 class TaskResult(BaseModel):
     worker_id: str = Field(min_length=1, max_length=120)
     result: dict[str, Any]
     metrics: dict[str, Any] = Field(default_factory=dict)
+    artifacts: list[ArtifactSpec] = Field(default_factory=list, max_length=1000)
+    receipt_key: str | None = Field(default=None, min_length=6, max_length=160)
+    retention_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class DownloadAuthorizationRequest(BaseModel):
+    task_id: int = Field(ge=1)
+    version: int | None = Field(default=None, ge=1)
+    requester: str = Field(min_length=1, max_length=120)
+
+
+class WithdrawRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
 
 
 class TaskFailure(BaseModel):

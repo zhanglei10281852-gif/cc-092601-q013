@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Iterable
 
 from app.compute.repository import ComputeRepository
 from app.core.clock import Clock, SystemClock, to_storage
-from app.core.errors import ConflictError, NotFoundError, ValidationError
+from app.core.errors import ConflictError, NotFoundError, PermissionDeniedError, ValidationError
 from app.database import get_connection, transaction
+
+DEFAULT_ARTIFACT_ROOT = Path(__file__).resolve().parent.parent / "data" / "artifacts"
+ARTIFACT_PURPOSES = {"grid", "log", "checklist", "other"}
 
 
 def digest(value: Any) -> str:
@@ -17,13 +22,31 @@ def digest(value: Any) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-class ComputeOperationsService:
-    """管理计算模板、配额、任务租约、结果版本和人工干预。"""
+def _validate_relative_path(relative_path: str) -> None:
+    if not relative_path:
+        raise ValidationError("制品路径不能为空")
+    if "\\" in relative_path or relative_path.startswith("/") or ".." in PurePosixPath(relative_path).parts:
+        raise ValidationError("制品路径必须是制品根目录内的安全相对路径", context={"relative_path": relative_path})
 
-    def __init__(self, connection: sqlite3.Connection | None = None, clock: Clock | None = None) -> None:
+
+class ComputeOperationsService:
+    """管理计算模板、配额、任务租约、结果版本、制品元数据和人工干预。"""
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection | None = None,
+        clock: Clock | None = None,
+        *,
+        artifact_root: str | Path | None = None,
+        artifact_retention_days: int | None = None,
+        download_grant_seconds: int | None = None,
+    ) -> None:
         self.connection = connection or get_connection()
         self.clock = clock or SystemClock()
         self.repository = ComputeRepository(self.connection)
+        self.artifact_root = Path(artifact_root or os.getenv("TOWNSHIP_ARTIFACT_ROOT", str(DEFAULT_ARTIFACT_ROOT))).expanduser()
+        self.artifact_retention_days = artifact_retention_days or int(os.getenv("TOWNSHIP_ARTIFACT_RETENTION_DAYS", "30"))
+        self.download_grant_seconds = download_grant_seconds or int(os.getenv("TOWNSHIP_DOWNLOAD_GRANT_SECONDS", "900"))
 
     def list_templates(self) -> list[dict[str, Any]]:
         return self.repository.active_templates()
@@ -78,7 +101,10 @@ class ComputeOperationsService:
         if row is None:
             raise NotFoundError("计算任务不存在")
         result = dict(row)
-        result["results"] = self.repository.result_versions(task_id)
+        results = self.repository.result_versions(task_id)
+        for item in results:
+            item["artifacts"] = self.repository.artifacts_for(task_id, int(item["version"]))
+        result["results"] = results
         result["interventions"] = self.repository.interventions(task_id)
         return result
 
@@ -112,25 +138,52 @@ class ComputeOperationsService:
                 raise ConflictError("任务未由当前工作者持有")
             return dict(ComputeRepository(connection).task_by_id(task_id))
 
-    def complete(self, task_id: int, worker_id: str, result: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
-        now = to_storage(self.clock.now())
+    def complete(
+        self,
+        task_id: int,
+        worker_id: str,
+        result: dict[str, Any],
+        metrics: dict[str, Any],
+        artifacts: Iterable[dict[str, Any]] | None = None,
+        receipt_key: str | None = None,
+        retention_days: int | None = None,
+    ) -> dict[str, Any]:
+        manifest = self._normalize_manifest(artifacts or [])
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        result_digest = digest({"result": result, "metrics": metrics, "artifacts": manifest})
+        effective_receipt = receipt_key or f"content-{result_digest}"
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
             task = repository.task_by_id(task_id)
             if task is None:
                 raise NotFoundError("计算任务不存在")
+            existing = repository.result_by_receipt(task_id, effective_receipt)
+            if existing is not None:
+                if existing["result_digest"] != result_digest:
+                    raise ConflictError("同一回执键对应了不同的结果内容")
+                replay = dict(repository.task_by_id(task_id))
+                replay["replayed"] = True
+                return replay
             if task["status"] != "running" or task["lease_owner"] != worker_id:
                 raise ConflictError("任务未由当前工作者持有")
+            self._verify_manifest(manifest)
+            days = retention_days if retention_days is not None else self.artifact_retention_days
+            retention_until = to_storage(now_value + timedelta(days=days))
             version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM compute_results WHERE task_id=?", (task_id,)).fetchone()[0])
             connection.execute(
-                "INSERT INTO compute_results(task_id,version,result_json,metrics_json,result_digest,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (task_id, version, json.dumps(result, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False, sort_keys=True), digest({"result": result, "metrics": metrics}), worker_id, now),
+                "INSERT INTO compute_results(task_id,version,result_json,metrics_json,result_digest,receipt_key,status,retention_until,created_by,created_at) VALUES(?,?,?,?,?,?,'candidate',?,?,?)",
+                (task_id, version, json.dumps(result, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False, sort_keys=True), result_digest, effective_receipt, retention_until, worker_id, now),
             )
+            for item in manifest:
+                repository.add_artifact(task_id=task_id, result_version=version, receipt_key=effective_receipt, now=now, **item)
             connection.execute(
                 "UPDATE compute_tasks SET status='succeeded',current_result_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                 (version, now, now, task_id),
             )
-            return dict(repository.task_by_id(task_id))
+            completed = dict(repository.task_by_id(task_id))
+            completed["replayed"] = False
+            return completed
 
     def fail(self, task_id: int, worker_id: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:
         now_value = self.clock.now()
@@ -157,8 +210,8 @@ class ComputeOperationsService:
 
     def retry(self, task_id: int, actor: str, reason: str, priority: int | None = None, batch_key: str = "") -> dict[str, Any]:
         def mutate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
-            if task["status"] not in {"failed", "cancelled"}:
-                raise ConflictError("只有失败或已取消任务可以人工重试")
+            if task["status"] not in {"failed", "cancelled", "succeeded"}:
+                raise ConflictError("只有失败、已取消或已成功任务可以人工重试")
             chosen = task["priority"] if priority is None else priority
             connection.execute("UPDATE compute_tasks SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, task["id"]))
         return self._intervene(task_id, actor, reason, "retry", batch_key, mutate)
@@ -209,6 +262,164 @@ class ComputeOperationsService:
                 after = dict(repository.task_by_id(task["id"]))
                 repository.add_intervention(task_id=task["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
         return {"recovered": recovered, "exhausted": exhausted}
+
+    def list_artifacts(self, task_id: int, version: int | None = None) -> list[dict[str, Any]]:
+        if self.repository.task_by_id(task_id) is None:
+            raise NotFoundError("计算任务不存在")
+        return self.repository.artifacts_for(task_id, version)
+
+    def publish_result(self, task_id: int, version: int, actor: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            if repository.task_by_id(task_id) is None:
+                raise NotFoundError("计算任务不存在")
+            row = repository.result_version(task_id, version)
+            if row is None:
+                raise NotFoundError("结果版本不存在")
+            if row["status"] == "published":
+                return self._version_payload(repository, row)
+            if row["status"] == "withdrawn":
+                raise ConflictError("已撤回的结果版本不能重新发布")
+            connection.execute("UPDATE compute_results SET status='published',published_at=? WHERE task_id=? AND version=?", (now, task_id, version))
+            after = repository.result_version(task_id, version)
+            repository.add_intervention(task_id=task_id, actor=actor, action="publish_result", reason=f"发布结果版本 {version}", before=dict(row), after=dict(after), batch_key="", now=now)
+            return self._version_payload(repository, after)
+
+    def withdraw_result(self, task_id: int, version: int, actor: str, reason: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            if repository.task_by_id(task_id) is None:
+                raise NotFoundError("计算任务不存在")
+            row = repository.result_version(task_id, version)
+            if row is None:
+                raise NotFoundError("结果版本不存在")
+            if row["status"] == "withdrawn":
+                return self._version_payload(repository, row)
+            connection.execute("UPDATE compute_results SET status='withdrawn',withdrawn_at=?,withdraw_reason=? WHERE task_id=? AND version=?", (now, reason[:1000], task_id, version))
+            after = repository.result_version(task_id, version)
+            repository.add_intervention(task_id=task_id, actor=actor, action="withdraw_result", reason=reason, before=dict(row), after=dict(after), batch_key="", now=now)
+            return self._version_payload(repository, after)
+
+    def authorize_download(self, task_id: int, version: int | None, requester: str) -> dict[str, Any]:
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        with transaction() as connection:
+            repository = ComputeRepository(connection)
+            task = repository.task_by_id(task_id)
+            if task is None:
+                raise NotFoundError("计算任务不存在")
+            chosen = version if version is not None else task["current_result_version"]
+            if chosen is None:
+                raise NotFoundError("任务还没有可用的结果版本")
+            row = repository.result_version(task_id, int(chosen))
+            if row is None:
+                raise NotFoundError("结果版本不存在")
+            if requester != task["requested_by"] and not repository.is_active_admin(requester):
+                raise PermissionDeniedError("无权下载该结果版本")
+            if row["status"] == "withdrawn":
+                raise ConflictError("结果版本已被撤回，无法授权下载")
+            retention_until = row["retention_until"] or ""
+            if retention_until and retention_until < now:
+                raise ConflictError("结果版本已过保留期，无法授权下载")
+            return {
+                "task_id": task_id,
+                "version": int(chosen),
+                "status": row["status"],
+                "retention_until": retention_until or None,
+                "grant_expires_at": to_storage(now_value + timedelta(seconds=self.download_grant_seconds)),
+                "artifacts": repository.artifacts_for(task_id, int(chosen)),
+            }
+
+    def cleanup_plan(self) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        classes: dict[str, list[dict[str, Any]]] = {"temporary": [], "candidate": [], "published": [], "withdrawn": []}
+        for row in self.repository.artifact_cleanup_rows():
+            category, deletable, block_reason = self._classify_artifact(row, now)
+            classes[category].append({
+                "artifact_id": int(row["id"]),
+                "task_id": int(row["task_id"]),
+                "result_version": int(row["result_version"]),
+                "relative_path": row["relative_path"],
+                "size_bytes": int(row["size_bytes"]),
+                "digest": row["digest"],
+                "purpose": row["purpose"],
+                "retention_until": row["retention_until"] or None,
+                "deletable": deletable,
+                "block_reason": block_reason,
+            })
+        summary = {
+            name: {
+                "artifacts": len(items),
+                "bytes": sum(item["size_bytes"] for item in items),
+                "deletable": sum(1 for item in items if item["deletable"]),
+            }
+            for name, items in classes.items()
+        }
+        return {"generated_at": now, "artifact_root": str(self.artifact_root), "classes": classes, "summary": summary}
+
+    @staticmethod
+    def _classify_artifact(row: sqlite3.Row, now: str) -> tuple[str, bool, str]:
+        status = row["result_status"]
+        retention_until = row["retention_until"] or ""
+        in_retention = not retention_until or retention_until >= now
+        if status == "published":
+            return "published", False, "已发布结果仍引用该制品"
+        if status == "withdrawn":
+            if in_retention:
+                return "withdrawn", False, "制品仍在保留期内"
+            return "withdrawn", True, ""
+        is_current = row["current_result_version"] is not None and int(row["result_version"]) == int(row["current_result_version"]) and row["task_status"] not in {"cancelled", "failed"}
+        if not is_current:
+            return "temporary", True, ""
+        if in_retention:
+            return "candidate", False, "制品仍在保留期内"
+        return "candidate", True, ""
+
+    @staticmethod
+    def _version_payload(repository: ComputeRepository, row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["artifacts"] = repository.artifacts_for(int(payload["task_id"]), int(payload["version"]))
+        return payload
+
+    @staticmethod
+    def _normalize_manifest(artifacts: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        manifest: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in artifacts:
+            relative_path = str(raw.get("relative_path", "")).strip()
+            purpose = str(raw.get("purpose", "other"))
+            size_bytes = raw.get("size_bytes")
+            artifact_digest = str(raw.get("digest", "")).lower()
+            if purpose not in ARTIFACT_PURPOSES:
+                raise ValidationError(f"制品用途不合法：{purpose or '<empty>'}")
+            _validate_relative_path(relative_path)
+            if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
+                raise ValidationError("制品大小必须是非负整数", context={"relative_path": relative_path})
+            if len(artifact_digest) != 64 or any(char not in "0123456789abcdef" for char in artifact_digest):
+                raise ValidationError("制品摘要必须是 64 位十六进制 sha256", context={"relative_path": relative_path})
+            if relative_path in seen:
+                raise ValidationError("制品清单包含重复路径", context={"relative_path": relative_path})
+            seen.add(relative_path)
+            manifest.append({"relative_path": relative_path, "size_bytes": size_bytes, "digest": artifact_digest, "purpose": purpose})
+        manifest.sort(key=lambda item: item["relative_path"])
+        return manifest
+
+    def _verify_manifest(self, manifest: list[dict[str, Any]]) -> None:
+        root = self.artifact_root.resolve()
+        for item in manifest:
+            target = (root / item["relative_path"]).resolve()
+            if not target.is_relative_to(root):
+                raise ValidationError("制品路径越出制品根目录", context={"relative_path": item["relative_path"]})
+            if not target.is_file():
+                raise ValidationError("制品文件不存在", context={"relative_path": item["relative_path"]})
+            actual_size = target.stat().st_size
+            if actual_size != item["size_bytes"]:
+                raise ValidationError("制品大小与清单不一致", context={"relative_path": item["relative_path"], "declared": item["size_bytes"], "actual": actual_size})
+            actual_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            if actual_digest != item["digest"]:
+                raise ValidationError("制品摘要与清单不一致", context={"relative_path": item["relative_path"]})
 
     def summary(self) -> dict[str, Any]:
         rows = self.connection.execute("SELECT status,COUNT(*) AS amount FROM compute_tasks GROUP BY status ORDER BY status").fetchall()

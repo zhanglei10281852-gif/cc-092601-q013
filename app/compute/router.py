@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import BatchOperation, CancelRequest, DownloadAuthorizationRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate, WithdrawRequest
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -54,7 +54,15 @@ def heartbeat(task_id: int, payload: TaskClaim):
 
 @router.post("/tasks/{task_id}/complete")
 def complete_task(task_id: int, payload: TaskResult):
-    return service().complete(task_id, payload.worker_id, payload.result, payload.metrics)
+    return service().complete(
+        task_id,
+        payload.worker_id,
+        payload.result,
+        payload.metrics,
+        artifacts=[item.model_dump() for item in payload.artifacts],
+        receipt_key=payload.receipt_key,
+        retention_days=payload.retention_days,
+    )
 
 
 @router.post("/tasks/{task_id}/fail")
@@ -80,6 +88,31 @@ def set_priority(task_id: int, payload: PriorityRequest):
 @router.post("/tasks/batch")
 def batch_operation(payload: BatchOperation):
     return service().batch_operation(payload.model_dump())
+
+
+@router.get("/tasks/{task_id}/artifacts")
+def list_artifacts(task_id: int, version: int | None = None):
+    return {"items": service().list_artifacts(task_id, version)}
+
+
+@router.post("/tasks/{task_id}/results/{version}/publish")
+def publish_result(task_id: int, version: int, actor: str = Query(..., min_length=1)):
+    return service().publish_result(task_id, version, actor)
+
+
+@router.post("/tasks/{task_id}/results/{version}/withdraw")
+def withdraw_result(task_id: int, version: int, payload: WithdrawRequest):
+    return service().withdraw_result(task_id, version, payload.actor, payload.reason)
+
+
+@router.post("/downloads/authorize")
+def authorize_download(payload: DownloadAuthorizationRequest):
+    return service().authorize_download(payload.task_id, payload.version, payload.requester)
+
+
+@router.get("/cleanup/plan")
+def cleanup_plan():
+    return service().cleanup_plan()
 
 
 @router.post("/recovery/expired-leases")
